@@ -1,73 +1,115 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 
+import argparse
 import datetime
+import filecmp
+import glob
 import logging
 import os
+import re
 import shutil
-import sys
 
 from gi.repository import GExiv2
 
-source = sys.argv[1]
-target = sys.argv[2]
-log_file = 'eos_digital_import.log'
+NUM_ARGS = 0
 
+log_file = 'eos_digital_import.log'
 logging.basicConfig(filename=log_file, level=logging.DEBUG)
 
-def get_files(path):
-    files = list()
-    for filename in os.listdir(path):
-        filename = os.path.abspath(os.path.join(path, filename))
-        if os.path.isdir(filename):
-            files.extend(get_files(filename))
-        else:
-            files.append(filename)
-    return files
+def getting_listing(path):
+    """return list with all file into path and subpath"""
+    res = list()
+    for f in glob.glob(os.path.join(path,'*')):
+        if os.path.isdir(f):
+            res.extend(getting_listing(f))
+        elif os.path.isfile(f):
+            res.append(f)
+    return res
 
-def rename(src, target):
+def get_datetime(filename):
+    """Return datetime from EXIF, filename or modification time (in this order)."""
+    # Get datetime from EXIF
     try:
-        exif = GExiv2.Metadata(src)
-    except IOError:
-        return False
-
-    try:
+        exif = GExiv2.Metadata(filename)
         exifdate = exif.get_tag_string('Exif.Photo.DateTimeOriginal')
-        if exifdate == None:
-            return False
-        date = datetime.datetime.strptime(exifdate, '%Y:%m:%d %H:%M:%S')
+        if exifdate:
+            return datetime.datetime.strptime(exifdate, '%Y:%m:%d %H:%M:%S')
+    except IOError:
+        return None
     except KeyError:
-        return False
+        pass
 
-    destination = os.path.join(target, date.strftime('%Y/%m/%d'))
-    if not os.path.lexists(destination):
-        os.makedirs(destination)
+    # Get datetime from filename
+    try:
+        fname = os.path.splitext(filename)[0]
+        return datetime.datetime.strptime(fname[-15:], '%Y%m%d_%H%M%S')
+    except ValueError:
+        pass
 
-    ext = os.path.splitext(src)[-1]
-    for index in xrange(1, 255):
-        filename = date.strftime('%Y%m%d_%H%M%S' + '_%03d%s' %(index, ext))
-        filename = os.path.join(destination, filename)
-        if not os.path.lexists(filename):
-            shutil.copy2(src, filename)
-            return filename
+    # Get datetime from mtime
+    return datetime.datetime.utcfromtimestamp(os.stat(filename).st_mtime)
 
-    return False
+def get_timedelta(dtime):
+    """Extract timedelta for dtime argument """
+    try:
+        m = re.match(r'([+-]?)(\d{1,2}):(\d{2})', dtime or '')
+        sens, hours, minutes = m.group(1, 2, 3)
+    except AttributeError, TypeError:
+        return datetime.timedelta()
 
-for file in get_files(source):
-    print 'file:', file
-    res = rename(file, target)
-    if res:
-        logging.debug('%s copied in %s.' % (file, res))
-#        os.remove(file)
+    tdelta = datetime.timedelta(hours=int(hours), minutes=int(minutes))
+    if sens == '-':
+        tdelta = -tdelta
+    return tdelta
 
-    elif os.path.splitext(file)[-1].upper() in ('.MOV', '.MP4'):
-        mtime = os.stat(file).st_mtime
-        date = datetime.datetime.utcfromtimestamp(mtime)
-        dst = os.path.join(target, date.strftime('%Y/%m/%d/%Y%m%d_%H%M%S' + '_%s' %(os.path.split(file)[1])))
-        shutil.copy2(file, dst)
-        logging.debug('%s copied in %s.' % (file, dst))
-#        os.remove(file)
+def search_newfilename(outpath, dfile, ext):
+    """Search new filename doesn't use. If file exist return None."""
+    for i in xrange(1,255):
+        newfname = dfile.strftime('%Y%m%d_%H%M%S' + '_{:03d}{}'.format(i, ext))
+        
+        newf = os.path.join(outpath, newfname)
+        if not os.path.exists(newf):
+            return newf
 
-    else:
-        logging.warn('%s failed.' % (file))
+        if filecmp.cmp(f, newf):
+            # file already exist identicaly
+            return None
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('input', type=str, help='Path from import files')
+    parser.add_argument('outpath', type=str, help='Path to export files')
+    parser.add_argument('--log', type=str, help='log file')
+    parser.add_argument('--dtime', type=str, help='Correct datetime EXIF (Format: +HH:MM)')
+    parser.add_argument('--remove', help='Remove file after transfert',
+                        action="store_true")
+
+    args = parser.parse_args()
+    tdelta = get_timedelta(args.dtime)
+
+    for f in getting_listing(args.input):
+        dfile = get_datetime(f) + tdelta
+
+        # Make path destination
+        outpath = os.path.join(args.outpath, dfile.strftime('%Y/%m/%d'))
+        if not os.path.lexists(outpath):
+            os.makedirs(outpath)
+
+        # Search new filename
+        froot, fext = os.path.splitext(f)
+        newfilename = search_newfilename(outpath, dfile, fext)
+        if not newfilename:
+            logging.debug('{} already exist in new path.'.format(f))
+            if args.remove:
+                os.remove(f)
+                logging.debug('{} removed.'.format(f))
+            continue
+
+        # Copy file to new path
+        shutil.copy2(f, newfilename)
+        logging.debug('{} copied in {}.'.format(f, newfilename))
+        if args.remove:
+            os.remove(f)
+            logging.debug('{} removed.'.format(f))
 
